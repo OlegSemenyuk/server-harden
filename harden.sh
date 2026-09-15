@@ -857,7 +857,6 @@ ipfw -q add 100 allow all from any to any via lo0
 ipfw -q add 110 deny  all from 127.0.0.0/8 to any in via \$pif
 ipfw -q add 120 deny  all from any to 127.0.0.0/8 in via \$pif
 ipfw -q add 200 allow tcp  from any to any established
-ipfw -q add 210 allow udp  from any to any established
 ipfw -q add 220 allow icmp from any to any icmptypes 0,3,8,11
 ipfw -q add 300 allow tcp  from any to me $CFG_SSH_PORT in via \$pif
 $(printf '%b' "$port_rules")
