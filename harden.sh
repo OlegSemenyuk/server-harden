@@ -271,12 +271,11 @@ gather() {
 
     # Firewall — на Linux всегда включён (iptables + ipset)
     # Спрашиваем только какие порты открыть публично
-    CFG_FW=true; CFG_PORTS="$D_PORTS"
+    CFG_FW=true; CFG_PORTS=""
     if [[ "$OS_FAMILY" == "debian" ]]; then
         CFG_PORTS=$(wh_in "Firewall — открытые порты" \
-            "iptables + ipset будут настроены в любом случае.\nКакие TCP порты открыть публично (кроме SSH)?" "$D_PORTS")
+            "iptables + ipset будут настроены в любом случае.\nКакие TCP порты открыть публично (кроме SSH)?\n\nПример: 80,443\nОставь пустым — не открывать дополнительных портов." "$D_PORTS")
         CFG_PORTS=$(trim "$CFG_PORTS")
-        [[ -z "$CFG_PORTS" ]] && CFG_PORTS="$D_PORTS"
     elif wh_yn "Firewall (FreeBSD)" "Настроить firewall (ipfw/pf)?"; then
         CFG_FW=true
         CFG_PORTS=$(wh_in "Firewall" \
@@ -506,7 +505,7 @@ apply_ssh() {
     local cfg="/etc/ssh/sshd_config"
     cp "$cfg" "${cfg}.bak.$(date +%s)"
 
-    sshd_set ListenAddress            "0.0.0.0"
+    # ListenAddress не трогаем — дефолт уже 0.0.0.0, двойная запись ломает sshd
     sshd_set Port                         "$CFG_SSH_PORT"
     sshd_set Protocol                     "2"
     sshd_set PermitEmptyPasswords         "no"
@@ -678,8 +677,6 @@ EOF
     info "ipset ssh_allow создан → /etc/ipset.conf"
 
     # ── iptables правила ──────────────────────────────────────────────────────
-    IFS=',' read -ra ALLOW_PORTS <<< "$CFG_PORTS"
-
     iptables -F; iptables -X; iptables -Z
     iptables -P INPUT   DROP
     iptables -P FORWARD DROP
@@ -699,16 +696,31 @@ EOF
         -m set --match-set ssh_allow src -j ACCEPT
     info "SSH port $CFG_SSH_PORT → только через ipset ssh_allow (остальные DROP по политике)"
 
-    # Остальные порты — публично
-    for p in "${ALLOW_PORTS[@]}"; do
-        p="${p// /}"; [[ -z "$p" ]] && continue
-        iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
-        info "Allowed TCP port $p"
-    done
+    # Публичные порты — только если указаны
+    if [[ -n "$CFG_PORTS" ]]; then
+        IFS=',' read -ra ALLOW_PORTS <<< "$CFG_PORTS"
+        for p in "${ALLOW_PORTS[@]}"; do
+            p="${p// /}"; [[ -z "$p" ]] && continue
+            iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
+            info "Allowed TCP port $p"
+        done
+    else
+        info "Дополнительных публичных портов нет"
+    fi
 
     # ── Port knocking → добавляет IP в ssh_allow ──────────────────────────────
+    # Определяем IP текущей SSH сессии (SSH_CONNECTION не передаётся через sudo)
     local cur_ip=""
+    # Method 1: SSH_CONNECTION (работает без sudo)
     cur_ip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+    # Method 2: who am i (работает через sudo)
+    [[ -z "$cur_ip" ]] && \
+        cur_ip=$(who am i 2>/dev/null | grep -oE '\([0-9.]+\)' | tr -d '()')
+    # Method 3: ss — смотрим установленные соединения на наш порт
+    [[ -z "$cur_ip" ]] && \
+        cur_ip=$(ss -tn state established 2>/dev/null \
+            | awk -v p=":$CFG_SSH_PORT" '$4 ~ p {split($5,a,":");print a[1]}' \
+            | grep -v '^$' | head -1)
 
     if $CFG_KNOCK; then
         read -ra KP <<< "$CFG_KNOCK_SEQ"
@@ -857,6 +869,7 @@ ipfw -q add 100 allow all from any to any via lo0
 ipfw -q add 110 deny  all from 127.0.0.0/8 to any in via \$pif
 ipfw -q add 120 deny  all from any to 127.0.0.0/8 in via \$pif
 ipfw -q add 200 allow tcp  from any to any established
+ipfw -q add 210 allow udp  from any to any established
 ipfw -q add 220 allow icmp from any to any icmptypes 0,3,8,11
 ipfw -q add 300 allow tcp  from any to me $CFG_SSH_PORT in via \$pif
 $(printf '%b' "$port_rules")
