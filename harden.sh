@@ -83,6 +83,21 @@ pkg_install() {
         freebsd) pkg install -y "$@" >> "$LOG" 2>&1 ;;
     esac
 }
+# Установить только отсутствующие пакеты (не обновлять если уже стоят)
+pkg_ensure() {
+    local missing=()
+    for p in "$@"; do
+        case "$OS_FAMILY" in
+            debian)  dpkg -l "$p" 2>/dev/null | grep -q "^ii" || missing+=("$p") ;;
+            freebsd) pkg info -e "$p" 2>/dev/null || missing+=("$p") ;;
+        esac
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        info "Устанавливаю: ${missing[*]}"
+        pkg_update
+        pkg_install "${missing[@]}"
+    fi
+}
 
 # ── sshd_config helper ────────────────────────────────────────────────────────
 sshd_set() {
@@ -94,24 +109,35 @@ sshd_set() {
     fi
 }
 
-# ── Whiptail wrappers ─────────────────────────────────────────────────────────
-# Своп 3>&1 1>&2 2>&3: dialog рисуется на терминал, результат идёт в stdout
+# ── Dialog / Whiptail wrappers ────────────────────────────────────────────────
+# FreeBSD: dialog (base system) | Linux: whiptail
+# Своп 3>&1 1>&2 2>&3: UI рисуется на терминал, результат в stdout
 BT="Server Hardening v${HARDEN_VER}"
+DIALOG_CMD=""
 
-wh_in()  { whiptail --backtitle "$BT" --title "$1" --inputbox    "$2" 10 68 "$3" 3>&1 1>&2 2>&3; }
-wh_pw()  { whiptail --backtitle "$BT" --title "$1" --passwordbox "$2" 10 68       3>&1 1>&2 2>&3; }
-wh_yn()  { whiptail --backtitle "$BT" --title "$1" --yesno       "$2" 12 68; }
-wh_msg() { whiptail --backtitle "$BT" --title "$1" --msgbox      "$2" 20 72; }
-wh_menu(){ # wh_menu "title" "text" tag "desc" ...
-    local t="$1" txt="$2"; shift 2
-    whiptail --backtitle "$BT" --title "$t" \
-        --menu "$txt" 14 65 6 "$@" 3>&1 1>&2 2>&3
+setup_dialog() {
+    if   command -v whiptail &>/dev/null; then DIALOG_CMD="whiptail"
+    elif command -v dialog   &>/dev/null; then DIALOG_CMD="dialog"
+    else
+        case "$OS_FAMILY" in
+            debian)  pkg_install whiptail && DIALOG_CMD="whiptail" ;;
+            freebsd) die "dialog не найден — должен быть в base system" ;;
+        esac
+    fi
+    info "Dialog: $DIALOG_CMD"
 }
-wh_chk() { # wh_chk "title" "text" tag "desc" ON|OFF ...
-    local t="$1" txt="$2"; shift 2
-    whiptail --backtitle "$BT" --title "$t" \
-        --checklist "$txt" 22 72 12 "$@" 3>&1 1>&2 2>&3 | tr -d '"'
-}
+
+wh_in()  { $DIALOG_CMD --backtitle "$BT" --title "$1" --inputbox    "$2" 10 68 "$3" 3>&1 1>&2 2>&3; }
+wh_pw()  { $DIALOG_CMD --backtitle "$BT" --title "$1" --passwordbox "$2" 10 68       3>&1 1>&2 2>&3; }
+wh_yn()  { $DIALOG_CMD --backtitle "$BT" --title "$1" --yesno       "$2" 12 68; }
+wh_msg() { $DIALOG_CMD --backtitle "$BT" --title "$1" --msgbox      "$2" 20 72; }
+wh_menu(){ local t="$1" txt="$2"; shift 2
+    $DIALOG_CMD --backtitle "$BT" --title "$t" \
+        --menu "$txt" 14 65 6 "$@" 3>&1 1>&2 2>&3; }
+wh_chk() { local t="$1" txt="$2"; shift 2
+    $DIALOG_CMD --backtitle "$BT" --title "$t" \
+        --checklist "$txt" 22 72 12 "$@" 3>&1 1>&2 2>&3 | tr -d '"'; }
+
 
 # ── Gather settings ───────────────────────────────────────────────────────────
 gather() {
@@ -132,6 +158,7 @@ gather() {
     # Timezone — определяем автоматически, не спрашиваем
     CFG_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null \
           || cat /etc/timezone 2>/dev/null \
+          || readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||' \
           || echo "UTC")
     CFG_TZ=$(trim "$CFG_TZ")
     [[ -z "$CFG_TZ" ]] && CFG_TZ="UTC"
@@ -559,9 +586,19 @@ apply_ssh() {
         info "Добавлено $added SSH ключ(а) для root"
     fi
 
-    mkdir -p /run/sshd
-    chmod 755 /run/sshd
-    chown root:root /run/sshd
+    # Privilege separation directory
+    case "$OS_FAMILY" in
+        debian)
+            mkdir -p /run/sshd
+            chmod 755 /run/sshd
+            chown root:root /run/sshd
+            ;;
+        freebsd)
+            mkdir -p /var/run/sshd
+            chmod 755 /var/run/sshd
+            chown root:wheel /var/run/sshd
+            ;;
+    esac
     sshd -t >> "$LOG" 2>&1 || die "sshd config validation failed — see $LOG"
 
     case "$OS_FAMILY" in
@@ -638,8 +675,8 @@ apply_2fa() {
             google-authenticator -t -d -f -r 3 -R 30 -W || \
                 warn "Ошибка google-authenticator для root"
         else
-            # Создаём .google_authenticator от имени юзера
-            su -c "google-authenticator -t -d -f -r 3 -R 30 -W" "$fa_user" || \
+            # sudo -u работает на Linux и FreeBSD (su синтаксис разный)
+            sudo -u "$fa_user" google-authenticator -t -d -f -r 3 -R 30 -W || \
                 warn "Ошибка google-authenticator для $fa_user"
         fi
         echo ""
@@ -716,11 +753,18 @@ EOF
     # Method 2: who am i (работает через sudo)
     [[ -z "$cur_ip" ]] && \
         cur_ip=$(who am i 2>/dev/null | grep -oE '\([0-9.]+\)' | tr -d '()')
-    # Method 3: ss — смотрим установленные соединения на наш порт
-    [[ -z "$cur_ip" ]] && \
-        cur_ip=$(ss -tn state established 2>/dev/null \
-            | awk -v p=":$CFG_SSH_PORT" '$4 ~ p {split($5,a,":");print a[1]}' \
-            | grep -v '^$' | head -1)
+    # Method 3: ss (Linux) или sockstat (FreeBSD)
+    if [[ -z "$cur_ip" ]]; then
+        if command -v ss &>/dev/null; then
+            cur_ip=$(ss -tn state established 2>/dev/null \
+                | awk -v p=":$CFG_SSH_PORT" '$4 ~ p {split($5,a,":");print a[1]}' \
+                | grep -v '^$' | head -1)
+        elif command -v sockstat &>/dev/null; then
+            cur_ip=$(sockstat -4c 2>/dev/null \
+                | awk -v p="$CFG_SSH_PORT" '$5 ~ ":"p"$" {split($6,a,":");print a[1]}' \
+                | head -1)
+        fi
+    fi
 
     if $CFG_KNOCK; then
         read -ra KP <<< "$CFG_KNOCK_SEQ"
@@ -847,42 +891,112 @@ EOF
 
 # ── Firewall — FreeBSD / ipfw ─────────────────────────────────────────────────
 apply_fw_freebsd_ipfw() {
-    hdr "Firewall — ipfw"
+    hdr "Firewall — ipfw (tables)"
+
+    # Загружаем модуль ipfw если не загружен
+    if ! kldstat -qn ipfw 2>/dev/null; then
+        info "Загружаю модуль ipfw..."
+        kldload ipfw 2>/dev/null || \
+            die "Не удалось загрузить ipfw. Добавь ipfw_load=\"YES\" в /boot/loader.conf и перезагрузись."
+    fi
+    grep -q 'ipfw_load' /boot/loader.conf 2>/dev/null || \
+        echo 'ipfw_load="YES"' >> /boot/loader.conf
+
     local iface
     iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}' || echo "em0")
-    IFS=',' read -ra ALLOW_PORTS <<< "$CFG_PORTS"
-    local rules_file="/etc/ipfw.rules"
-    local n=400
-    local port_rules=""
-    for p in "${ALLOW_PORTS[@]}"; do
-        p="${p// /}"; [[ -z "$p" ]] && continue
-        port_rules+="ipfw -q add $n allow tcp from any to me $p in via \$pif\n"
-        (( n += 10 ))
-    done
 
-    cat > "$rules_file" << EOF
+    local fw_file="/etc/firewall.conf"
+
+    # Бэкап существующего файла
+    if [[ -f "$fw_file" ]]; then
+        local bak="${fw_file}.bak.$(date +%s)"
+        cp "$fw_file" "$bak"
+        warn "Бэкап: $bak"
+    fi
+
+    # Правила для публичных портов
+    local n=400 port_rules=""
+    if [[ -n "$CFG_PORTS" ]]; then
+        IFS=',' read -ra ALLOW_PORTS <<< "$CFG_PORTS"
+        for p in "${ALLOW_PORTS[@]}"; do
+            p="${p// /}"; [[ -z "$p" ]] && continue
+            port_rules+="\${FwCMD} add $n allow tcp from any to me $p in via \${pif}\n"
+            n=$(( n + 10 ))
+        done
+    fi
+
+    cat > "$fw_file" << FWEOF
 #!/bin/sh
+# /etc/firewall.conf
 # Generated by server-harden.sh $(date)
-pif="$iface"
-ipfw -q -f flush
-ipfw -q add 100 allow all from any to any via lo0
-ipfw -q add 110 deny  all from 127.0.0.0/8 to any in via \$pif
-ipfw -q add 120 deny  all from any to 127.0.0.0/8 in via \$pif
-ipfw -q add 200 allow tcp  from any to any established
-ipfw -q add 210 allow udp  from any to any established
-ipfw -q add 220 allow icmp from any to any icmptypes 0,3,8,11
-ipfw -q add 300 allow tcp  from any to me $CFG_SSH_PORT in via \$pif
-$(printf '%b' "$port_rules")
-ipfw -q add 900 allow all from me to any out via \$pif
-ipfw -q add 65000 deny log all from any to any
-EOF
 
-    chmod +x "$rules_file"
+FwCMD="/sbin/ipfw -q"
+pif="$iface"
+
+# ── Flush ─────────────────────────────────────────────────────────────────────
+\${FwCMD} -f flush
+
+# ── Tables ────────────────────────────────────────────────────────────────────
+# Table 10: ssh_allow — IPs с доступом по SSH
+#   Добавить IP:  ipfw table 10 add <IP>
+#   Удалить IP:   ipfw table 10 delete <IP>
+#   Список:       ipfw table 10 list
+\${FwCMD} table 10 flush
+
+# ── Loopback ──────────────────────────────────────────────────────────────────
+\${FwCMD} add 100 allow ip from any to any via lo0
+
+# ── Established TCP (ответы на наши соединения) ───────────────────────────────
+\${FwCMD} add 200 allow tcp from any to any established
+
+# ── ICMP ──────────────────────────────────────────────────────────────────────
+\${FwCMD} add 210 allow icmp from any to any icmptypes 0,3,8,11
+
+# ── Anti-scan: недопустимые комбинации TCP флагов ─────────────────────────────
+\${FwCMD} add 220 deny tcp from any to any tcpflags syn,fin
+\${FwCMD} add 225 deny tcp from any to any tcpflags syn,rst
+\${FwCMD} add 230 deny tcp from any to any tcpflags fin,syn,rst,psh,ack,urg
+
+# ── SSH: только из таблицы 10 ─────────────────────────────────────────────────
+\${FwCMD} add 300 allow tcp from "table(10)" to me $CFG_SSH_PORT in via \${pif}
+
+# ── Публичные порты ───────────────────────────────────────────────────────────
+$(printf '%b' "$port_rules")
+# ── Исходящий трафик + keep-state (UDP ответы через таблицу состояний) ────────
+\${FwCMD} add 900 allow ip from me to any out via \${pif} keep-state
+
+# ── Default deny ──────────────────────────────────────────────────────────────
+\${FwCMD} add 65000 deny log ip from any to any
+FWEOF
+
+    chmod +x "$fw_file"
+
+    # Определяем текущий IP и добавляем в таблицу 10 ДО применения правил
+    local cur_ip=""
+    cur_ip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
+    [[ -z "$cur_ip" ]] && cur_ip=$(who am i 2>/dev/null | grep -oE '\([0-9.]+\)' | tr -d '()')
+    [[ -z "$cur_ip" ]] && cur_ip=$(sockstat -4c 2>/dev/null \
+        | awk -v p="$CFG_SSH_PORT" '$5 ~ ":"p"$" {split($6,a,":");print a[1]}' | head -1)
+
+    # Применяем правила
+    sh "$fw_file" >> "$LOG" 2>&1 \
+        && info "ipfw rules applied → $fw_file" \
+        || warn "ipfw: проверь $fw_file и $LOG"
+
+    # Добавляем текущий IP в таблицу после применения правил
+    if [[ -n "$cur_ip" ]]; then
+        /sbin/ipfw table 10 add "$cur_ip" 2>/dev/null && \
+            info "Твой IP $cur_ip добавлен в ipfw table 10 (ssh_allow)"
+        warn "Удалить: ipfw table 10 delete $cur_ip"
+        warn "Добавить постоянно — в конец $fw_file:"
+        warn "  \${FwCMD} table 10 add $cur_ip"
+    else
+        warn "Текущий IP не определён — добавь вручную: ipfw table 10 add <IP>"
+    fi
+
     sysrc firewall_enable=YES firewall_logging=YES \
-          firewall_script="$rules_file" >> "$LOG" 2>&1
-    sh "$rules_file" >> "$LOG" 2>&1 \
-        && info "ipfw rules loaded" \
-        || warn "ipfw: проверь $rules_file и $LOG"
+          firewall_script="$fw_file" >> "$LOG" 2>&1
+    info "Firewall: $fw_file | Table 10 = ssh_allow"
 }
 
 apply_firewall() {
@@ -977,20 +1091,27 @@ EOF
             sysctl -p /etc/sysctl.d/99-harden.conf >> "$LOG" 2>&1
             info "sysctl settings applied" ;;
         freebsd)
-            cat >> /etc/sysctl.conf << 'EOF'
-
-# server-harden.sh
-net.inet.ip.redirect=0
-net.inet.icmp.drop_redirect=1
-net.inet.tcp.drop_synfin=1
-net.inet.ip.sourceroute=0
-net.inet.ip.accept_sourceroute=0
-kern.randompid=1
-security.bsd.see_other_uids=0
-security.bsd.see_other_gids=0
-security.bsd.unprivileged_read_msgbuf=0
-EOF
-            sysctl -f /etc/sysctl.conf >> "$LOG" 2>&1 || true
+            # Наши настройки — применяем каждый параметр отдельно
+            # (не через sysctl -f — это применит ВЕСЬ файл включая чужие настройки)
+            local bsd_settings=(
+                "net.inet.ip.redirect=0"
+                "net.inet.icmp.drop_redirect=1"
+                "net.inet.tcp.drop_synfin=1"
+                "net.inet.ip.sourceroute=0"
+                "net.inet.ip.accept_sourceroute=0"
+                "kern.randompid=1"
+                "security.bsd.see_other_uids=0"
+                "security.bsd.see_other_gids=0"
+                "security.bsd.unprivileged_read_msgbuf=0"
+            )
+            # Добавляем в sysctl.conf (если ещё нет)
+            for s in "${bsd_settings[@]}"; do
+                local key="${s%%=*}"
+                grep -q "^${key}" /etc/sysctl.conf 2>/dev/null || \
+                    echo "$s" >> /etc/sysctl.conf
+                # Применяем сейчас (игнорируем неизвестные OID — модуль может не быть загружен)
+                sysctl "$s" >> "$LOG" 2>/dev/null || true
+            done
             info "sysctl settings applied (FreeBSD)" ;;
     esac
 }
@@ -1029,40 +1150,67 @@ apply_pve() {
     $CFG_PVE || return 0
     hdr "VM / Proxmox VE Setup"
 
+    # qemu-guest-agent
     pkg_install qemu-guest-agent
-    systemctl enable qemu-guest-agent >> "$LOG" 2>&1
-    systemctl start  qemu-guest-agent >> "$LOG" 2>&1
+    case "$OS_FAMILY" in
+        debian)
+            systemctl enable qemu-guest-agent >> "$LOG" 2>&1
+            systemctl start  qemu-guest-agent >> "$LOG" 2>&1
+            ;;
+        freebsd)
+            sysrc qemu_guest_agent_enable="YES" >> "$LOG" 2>&1
+            service qemu-guest-agent start >> "$LOG" 2>&1 || true
+            ;;
+    esac
     info "qemu-guest-agent installed and started"
 
-    # ssh-toggle — устанавливаем всегда
+    # ssh-toggle — универсальный: работает на Linux и FreeBSD
     cat > /usr/local/bin/ssh-toggle << 'SCRIPT'
-#!/bin/bash
+#!/bin/sh
 # ssh-toggle [on|off|persist|status]
-SSH_SVC=$(systemctl list-unit-files 2>/dev/null \
-    | awk '/^ssh(d)?\.service/{print $1; exit}')
-case "${1:-status}" in
-    on)      systemctl start   "$SSH_SVC" && echo "SSH started (temporary)" ;;
-    off)     systemctl stop    "$SSH_SVC" && echo "SSH stopped" ;;
-    persist) systemctl enable  "$SSH_SVC"; systemctl start "$SSH_SVC" && echo "SSH enabled permanently" ;;
-    *)       systemctl is-active --quiet "$SSH_SVC" && echo "running" || echo "stopped" ;;
-esac
+if command -v systemctl >/dev/null 2>&1; then
+    # Linux (systemd)
+    SSH_SVC=$(systemctl list-unit-files 2>/dev/null \
+        | awk '/^ssh(d)?\.service/{print $1; exit}')
+    case "${1:-status}" in
+        on)       systemctl start  "$SSH_SVC" && echo "SSH started (temporary)" ;;
+        off)      systemctl stop   "$SSH_SVC" && echo "SSH stopped" ;;
+        persist)  systemctl enable "$SSH_SVC"; systemctl start "$SSH_SVC" && echo "SSH permanent" ;;
+        disable)  systemctl disable "$SSH_SVC"; systemctl stop "$SSH_SVC" ;;
+        *)        systemctl is-active --quiet "$SSH_SVC" && echo "running" || echo "stopped" ;;
+    esac
+else
+    # FreeBSD (rc.d)
+    case "${1:-status}" in
+        on)       service sshd start ;;
+        off)      service sshd stop ;;
+        persist)  sysrc sshd_enable="YES"; service sshd start && echo "SSH permanent" ;;
+        disable)  sysrc sshd_enable="NO";  service sshd stop ;;
+        *)        service sshd status ;;
+    esac
+fi
 SCRIPT
     chmod +x /usr/local/bin/ssh-toggle
-    info "ssh-toggle installed: ssh-toggle [on|off|persist|status]"
+    info "ssh-toggle installed: ssh-toggle [on|off|persist|disable|status]"
 
-    # SSH на VM/PVE:
-    # - Если port knocking включён — сервис должен работать (knockd открывает ipset)
-    # - Если без knock — тушим SSH, доступ только через консоль гипервизора
-    local ssh_svc
-    ssh_svc=$(systemctl list-unit-files 2>/dev/null \
-        | awk '/^ssh(d)?\.service/{print $1; exit}' || echo "sshd.service")
-
+    # SSH: с port knocking — сервис работает (ipfw/ipset контролируют доступ)
+    #       без knock — выключаем, доступ через консоль гипервизора
     if ${CFG_KNOCK:-false}; then
-        info "Port knocking активен — SSH сервис работает, закрыт iptables/ipset"
-        info "Доступ: knock HOST → автоматически откроет для твоего IP"
+        info "Port knocking активен — SSH сервис работает, доступ через knock"
     else
-        systemctl disable "$ssh_svc" >> "$LOG" 2>&1 || true
-        systemctl stop    "$ssh_svc" >> "$LOG" 2>&1 || true
+        case "$OS_FAMILY" in
+            debian)
+                local ssh_svc
+                ssh_svc=$(systemctl list-unit-files 2>/dev/null \
+                    | awk '/^ssh(d)?\.service/{print $1; exit}' || echo "sshd.service")
+                systemctl disable "$ssh_svc" >> "$LOG" 2>&1 || true
+                systemctl stop    "$ssh_svc" >> "$LOG" 2>&1 || true
+                ;;
+            freebsd)
+                sysrc sshd_enable="NO" >> "$LOG" 2>&1 || true
+                service sshd stop >> "$LOG" 2>&1 || true
+                ;;
+        esac
         info "SSH отключён по умолчанию"
         warn "Включить (через консоль): ssh-toggle on"
         warn "Включить постоянно:       ssh-toggle persist"
@@ -1073,24 +1221,26 @@ SCRIPT
 apply_misc() {
     hdr "Miscellaneous Hardening"
 
-    # PATH глобально через profile.d (работает без sudo)
+    # PATH глобально через profile.d (работает и на Linux и FreeBSD)
     cat > /etc/profile.d/99-sbin-path.sh << 'EOF'
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 EOF
     chmod 644 /etc/profile.d/99-sbin-path.sh
 
-    # Также в /etc/bash.bashrc для non-login shells
-    if ! grep -q "99-sbin-path" /etc/bash.bashrc 2>/dev/null; then
-        echo 'source /etc/profile.d/99-sbin-path.sh' >> /etc/bash.bashrc
+    # /etc/bash.bashrc — только Linux
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        if ! grep -q "99-sbin-path" /etc/bash.bashrc 2>/dev/null; then
+            echo 'source /etc/profile.d/99-sbin-path.sh' >> /etc/bash.bashrc
+        fi
     fi
 
-    # sudo secure_path — только если sudo установлен (мы его уже поставили)
+    # sudo secure_path — только если sudo установлен
     if command -v sudo &>/dev/null && [[ -d /etc/sudoers.d ]]; then
         echo 'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
             > /etc/sudoers.d/99-sbin-path
         chmod 440 /etc/sudoers.d/99-sbin-path
     fi
-    info "PATH глобально прописан (profile.d + bash.bashrc + sudoers)"
+    info "PATH глобально прописан"
 
     cat > /etc/issue.net << 'EOF'
 ***************************************************************************
@@ -1203,16 +1353,16 @@ main() {
     echo "  └──────────────────────────────────────────────┘"
     printf '%b\n\n' "$NC"
 
-    if ! command -v whiptail &>/dev/null; then
-        info "Устанавливаю whiptail..."
+    if ! command -v whiptail &>/dev/null && ! command -v dialog &>/dev/null; then
+        info "Устанавливаю whiptail/dialog..."
         pkg_update
-        pkg_install whiptail
+        pkg_install whiptail 2>/dev/null || pkg_install dialog 2>/dev/null || true
     fi
+    setup_dialog
 
-    # Устанавливаем базовые инструменты если нет
+    # Устанавливаем базовые инструменты только если отсутствуют
     hdr "Essential Tools"
-    pkg_update
-    pkg_install sudo mc curl wget
+    pkg_ensure sudo mc curl wget
     info "Базовые инструменты: sudo, mc, curl, wget"
 
     gather
