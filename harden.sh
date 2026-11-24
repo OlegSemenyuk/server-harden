@@ -3,13 +3,14 @@
 #  harden.sh — Universal Server Security Hardening Script
 #  OS Support : Ubuntu ≥ 20.04 | Debian ≥ 10 | FreeBSD ≥ 13
 #  Usage      : sudo bash harden.sh
-#  GitHub     : https://github.com/YOUR/server-harden
-#  Version    : 1.0.0
+#  GitHub     : https://github.com/OlegSemenyuk/server-harden
+#  Version    : 1.1.0
 # =============================================================================
 set -euo pipefail
+umask 022   # иначе при umask 002 конфиги становятся group-writable
 
 # ── Constants & defaults (override via env vars for non-interactive use) ──────
-HARDEN_VER="1.0.0"
+HARDEN_VER="1.1.0"
 LOG="/var/log/server-harden.log"
 
 D_SSH_PORT="${HARDEN_SSH_PORT:-22}"
@@ -103,7 +104,10 @@ pkg_ensure() {
 sshd_set() {
     local key="$1" val="$2" cfg="${3:-/etc/ssh/sshd_config}"
     if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$cfg"; then
-        perl -i -pe "s|^#?[[:space:]]*${key}[[:space:]].*|${key} ${val}|" "$cfg"
+        # первое вхождение (в т.ч. закомментированное) → новое значение, остальные удаляем
+        K="$key" V="$val" perl -i -ne '
+            if (/^#?[[:space:]]*\Q$ENV{K}\E[[:space:]]/i) { print "$ENV{K} $ENV{V}\n" unless $done++; next }
+            print' "$cfg"
     else
         printf '%s %s\n' "$key" "$val" >> "$cfg"
     fi
@@ -534,7 +538,8 @@ apply_ssh() {
 
     # ListenAddress не трогаем — дефолт уже 0.0.0.0, двойная запись ломает sshd
     sshd_set Port                         "$CFG_SSH_PORT"
-    sshd_set Protocol                     "2"
+    # Protocol не задаём: в OpenSSH ≥ 7.4 опция устарела, sshd ругается
+    perl -i -ne 'print unless /^[[:space:]]*Protocol[[:space:]]/i' "$cfg"
     sshd_set PermitEmptyPasswords         "no"
     sshd_set PrintLastLog                 "yes"
     sshd_set UsePAM                       "yes"
@@ -602,7 +607,7 @@ apply_ssh() {
     sshd -t >> "$LOG" 2>&1 || die "sshd config validation failed — see $LOG"
 
     case "$OS_FAMILY" in
-        debian)  systemctl restart sshd ;;
+        debian)  systemctl try-restart ssh ;;
         freebsd) service sshd restart >> "$LOG" 2>&1 ;;
     esac
 
@@ -644,7 +649,7 @@ apply_2fa() {
     sshd -t >> "$LOG" 2>&1 || die "sshd config error after 2FA setup"
 
     case "$OS_FAMILY" in
-        debian)  systemctl restart sshd ;;
+        debian)  systemctl try-restart ssh ;;
         freebsd) service sshd restart >> "$LOG" 2>&1 ;;
     esac
 
@@ -720,11 +725,11 @@ EOF
     iptables -P OUTPUT  ACCEPT
 
     iptables -A INPUT -i lo -j ACCEPT
-    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     iptables -A INPUT -p icmp -j ACCEPT
 
     # Anti-scan
-    iptables -A INPUT -p tcp ! --syn -m state --state NEW    -j DROP
+    iptables -A INPUT -p tcp ! --syn -m conntrack --ctstate NEW -j DROP
     iptables -A INPUT -p tcp --tcp-flags ALL ALL             -j DROP
     iptables -A INPUT -p tcp --tcp-flags ALL NONE            -j DROP
 
@@ -846,7 +851,7 @@ SKEOF
     if command -v ip6tables &>/dev/null; then
         ip6tables -P INPUT DROP; ip6tables -P FORWARD DROP; ip6tables -P OUTPUT ACCEPT
         ip6tables -A INPUT -i lo -j ACCEPT
-        ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        ip6tables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         ip6tables -A INPUT -p ipv6-icmp -j ACCEPT
         netfilter-persistent save >> "$LOG" 2>&1
         info "IPv6 hardened"
@@ -1035,22 +1040,9 @@ maxretry = 3
 bantime  = 86400
 EOF
 
-    if $CFG_2FA; then
-        cat >> /etc/fail2ban/jail.local << 'EOF'
-
-[google-authenticator]
-enabled  = true
-filter   = google-authenticator
-logpath  = /var/log/auth.log
-maxretry = 3
-bantime  = 86400
-EOF
-        cat > /etc/fail2ban/filter.d/google-authenticator.conf << 'EOF'
-[Definition]
-failregex = pam_google_authenticator.*user=.+ host=<HOST>
-ignoreregex =
-EOF
-    fi
+    # Отдельный jail для google-authenticator не нужен: неверный TOTP-код
+    # sshd логирует как неудачную аутентификацию, его ловит jail [sshd].
+    rm -f /etc/fail2ban/filter.d/google-authenticator.conf
 
     systemctl enable fail2ban >> "$LOG" 2>&1
     systemctl restart fail2ban >> "$LOG" 2>&1
@@ -1248,6 +1240,18 @@ EOF
 ***************************************************************************
 EOF
     info "Login banner set"
+
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        # Клиент ssh: GSSAPI без Kerberos только тормозит подключение
+        mkdir -p /etc/ssh/ssh_config.d
+        echo "GSSAPIAuthentication no" > /etc/ssh/ssh_config.d/10-local.conf
+        # systemd ≥ 256: генератор ssh-over-VSOCK падает в ВМ без vsock
+        # и может поднять sshd в обход ssh-toggle — отключаем
+        mkdir -p /etc/systemd/system-generators
+        ln -sfn /dev/null /etc/systemd/system-generators/systemd-ssh-generator
+        systemctl daemon-reload
+        info "ssh_config: GSSAPI off; systemd-ssh-generator отключён"
+    fi
 
     # Хелпер для добавления ключей после установки
     cat > /usr/local/bin/add-ssh-key << 'SCRIPT'
