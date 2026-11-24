@@ -4,13 +4,13 @@
 #  OS Support : Ubuntu ≥ 20.04 | Debian ≥ 10 | FreeBSD ≥ 13
 #  Usage      : sudo bash harden.sh
 #  GitHub     : https://github.com/OlegSemenyuk/server-harden
-#  Version    : 1.1.0
+#  Version    : 1.1.1
 # =============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 umask 022   # иначе при umask 002 конфиги становятся group-writable
 
 # ── Constants & defaults (override via env vars for non-interactive use) ──────
-HARDEN_VER="1.1.0"
+HARDEN_VER="1.1.1"
 LOG="/var/log/server-harden.log"
 
 D_SSH_PORT="${HARDEN_SSH_PORT:-22}"
@@ -30,6 +30,31 @@ err()  { echo -e "${R}[✗]${NC} $*" >&2; log "ERR   $*"; }
 die()  { err "$*"; exit 1; }
 hdr()  { printf '\n%b━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n  %s\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%b\n\n' "$C" "$*" "$NC"; }
 trim() { printf '%s' "$1" | tr -d '\n\r' | xargs; }
+
+# Не выходить молча: set -e без трапа прерывал скрипт без единого сообщения
+trap 'err "Скрипт прерван: строка $LINENO, команда: $BASH_COMMAND (подробности в $LOG)"' ERR
+
+# IP клиента текущей SSH-сессии (IPv4, для ssh_allow / table 10).
+# Никогда не завершается с ошибкой: пустой результат = IP не найден.
+# (Раньше grep без совпадений + pipefail молча обрывал скрипт, если он
+#  запущен с консоли или sudo убрал SSH_CONNECTION, а who пустой — Debian 13.)
+detect_client_ip() {
+    local ip="${SSH_CONNECTION:-}"; ip="${ip%% *}"
+    if [[ -z "$ip" ]]; then
+        ip=$(who am i 2>/dev/null | grep -oE '\([0-9.]+\)' | tr -d '()' || true)
+    fi
+    if [[ -z "$ip" ]] && command -v ss &>/dev/null; then
+        # ss -H с фильтром: колонки Recv-Q Send-Q Local Peer → $4 = клиент
+        ip=$(ss -Htn state established "( sport = :${CFG_SSH_PORT} )" 2>/dev/null \
+            | awk '{p=$4; sub(/:[0-9]+$/,"",p); sub(/^\[?::ffff:/,"",p); gsub(/[][]/,"",p); print p; exit}' || true)
+    fi
+    if [[ -z "$ip" ]] && command -v sockstat &>/dev/null; then
+        ip=$(sockstat -4c 2>/dev/null \
+            | awk -v p="$CFG_SSH_PORT" '$6 ~ ":"p"$" {split($7,a,":"); print a[1]; exit}' || true)
+    fi
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || ip=""
+    printf '%s' "$ip"
+}
 
 # ── Root check ────────────────────────────────────────────────────────────────
 check_root() {
@@ -751,25 +776,11 @@ EOF
     fi
 
     # ── Port knocking → добавляет IP в ssh_allow ──────────────────────────────
-    # Определяем IP текущей SSH сессии (SSH_CONNECTION не передаётся через sudo)
-    local cur_ip=""
-    # Method 1: SSH_CONNECTION (работает без sudo)
-    cur_ip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
-    # Method 2: who am i (работает через sudo)
+    # IP текущей SSH-сессии (SSH_CONNECTION → who → ss)
+    local cur_ip
+    cur_ip=$(detect_client_ip)
     [[ -z "$cur_ip" ]] && \
-        cur_ip=$(who am i 2>/dev/null | grep -oE '\([0-9.]+\)' | tr -d '()')
-    # Method 3: ss (Linux) или sockstat (FreeBSD)
-    if [[ -z "$cur_ip" ]]; then
-        if command -v ss &>/dev/null; then
-            cur_ip=$(ss -tn state established 2>/dev/null \
-                | awk -v p=":$CFG_SSH_PORT" '$4 ~ p {split($5,a,":");print a[1]}' \
-                | grep -v '^$' | head -1)
-        elif command -v sockstat &>/dev/null; then
-            cur_ip=$(sockstat -4c 2>/dev/null \
-                | awk -v p="$CFG_SSH_PORT" '$5 ~ ":"p"$" {split($6,a,":");print a[1]}' \
-                | head -1)
-        fi
-    fi
+        warn "IP SSH-сессии не определён (запуск с консоли?) — ssh_allow пуст. Добавить: ipset add ssh_allow <IP> -exist && ipset save > /etc/ipset.conf"
 
     if $CFG_KNOCK; then
         read -ra KP <<< "$CFG_KNOCK_SEQ"
@@ -977,11 +988,8 @@ FWEOF
     chmod +x "$fw_file"
 
     # Определяем текущий IP и добавляем в таблицу 10 ДО применения правил
-    local cur_ip=""
-    cur_ip=$(echo "${SSH_CONNECTION:-}" | awk '{print $1}')
-    [[ -z "$cur_ip" ]] && cur_ip=$(who am i 2>/dev/null | grep -oE '\([0-9.]+\)' | tr -d '()')
-    [[ -z "$cur_ip" ]] && cur_ip=$(sockstat -4c 2>/dev/null \
-        | awk -v p="$CFG_SSH_PORT" '$5 ~ ":"p"$" {split($6,a,":");print a[1]}' | head -1)
+    local cur_ip
+    cur_ip=$(detect_client_ip)
 
     # Применяем правила
     sh "$fw_file" >> "$LOG" 2>&1 \
@@ -1196,6 +1204,8 @@ SCRIPT
                 ssh_svc=$(systemctl list-unit-files 2>/dev/null \
                     | awk '/^ssh(d)?\.service/{print $1; exit}' || echo "sshd.service")
                 systemctl disable "$ssh_svc" >> "$LOG" 2>&1 || true
+                # Ubuntu ≥ 22.10: ssh.socket запускает sshd по первому подключению
+                systemctl disable --now ssh.socket >> "$LOG" 2>&1 || true
                 systemctl stop    "$ssh_svc" >> "$LOG" 2>&1 || true
                 ;;
             freebsd)
